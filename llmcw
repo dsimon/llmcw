@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+#
+# llmcw — Launch Claude Cowork with a selected local or cloud model.
+# Usage: llmcw [claude]   (default: claude)
+#
+# Provider config is written to ~/Library/Application Support/Claude/claude_desktop_config.json
+# (under the enterpriseConfig key) before launching Claude Desktop, and restored on exit.
+#
+set -euo pipefail
+
+# ── Configuration ──────────────────────────────────────────────────
+LLMCW_CONFIG="${HOME}/.llmcw/config.json"
+CLAUDE_CONFIG="${HOME}/Library/Application Support/Claude-3p/claude_desktop_config.json"
+INFERENCE_KEYS=(
+  inferenceProvider
+  inferenceGatewayBaseUrl
+  inferenceGatewayApiKey
+  inferenceGatewayAuthScheme
+  inferenceModels
+  inferenceGatewayHeaders
+)
+LM_STUDIO_URL="http://127.0.0.1:1234"
+LM_STUDIO_MODELS_API="${LM_STUDIO_URL}/api/v1/models"
+
+# ── Config file save/restore ────────────────────────────────────────
+# Saves enterpriseConfig and deploymentMode so both can be restored verbatim.
+save_prefs() {
+  local backup_file
+  backup_file="$(mktemp /tmp/llmcw-backup.XXXXXX.json)"
+  python3 - "$CLAUDE_CONFIG" "$backup_file" << 'PYEOF'
+import json, sys
+config_file, backup_file = sys.argv[1], sys.argv[2]
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+    snapshot = {
+        'enterpriseConfig': cfg.get('enterpriseConfig', {}),
+        'deploymentMode':   cfg.get('deploymentMode'),
+    }
+except Exception:
+    snapshot = {'enterpriseConfig': {}, 'deploymentMode': None}
+with open(backup_file, 'w') as f:
+    json.dump(snapshot, f)
+PYEOF
+  echo "$backup_file"
+}
+
+restore_prefs() {
+  local backup_file="$1"
+  python3 - "$CLAUDE_CONFIG" "$backup_file" << 'PYEOF'
+import json, sys
+config_file, backup_file = sys.argv[1], sys.argv[2]
+with open(backup_file) as f:
+    snapshot = json.load(f)
+ec = snapshot.get('enterpriseConfig', {})
+dm = snapshot.get('deploymentMode')
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+if ec:
+    cfg['enterpriseConfig'] = ec
+else:
+    cfg.pop('enterpriseConfig', None)
+if dm is not None:
+    cfg['deploymentMode'] = dm
+else:
+    cfg.pop('deploymentMode', None)
+with open(config_file, 'w') as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+  rm -f "$backup_file"
+  PREF_BACKUP_FILE=""
+}
+
+set_gateway_prefs() {
+  local base_url="$1" api_key="$2" auth_scheme="${3:-bearer}" models_json="${4:-}"
+  python3 - "$CLAUDE_CONFIG" "$base_url" "$api_key" "$auth_scheme" "$models_json" << 'PYEOF'
+import json, sys
+config_file, base_url, api_key, auth_scheme, models_json = sys.argv[1:]
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+ec = cfg.get('enterpriseConfig', {})
+ec['inferenceProvider'] = 'gateway'
+ec['inferenceGatewayBaseUrl'] = base_url
+ec['inferenceGatewayApiKey'] = api_key
+ec['inferenceGatewayAuthScheme'] = auth_scheme
+if models_json:
+    ec['inferenceModels'] = json.loads(models_json)
+cfg['enterpriseConfig'] = ec
+# deploymentMode must be "3p" so the bootstrap response includes gateway account config
+cfg['deploymentMode'] = '3p'
+with open(config_file, 'w') as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+}
+
+clear_gateway_prefs() {
+  local models_json="${1:-}"
+  python3 - "$CLAUDE_CONFIG" "$models_json" << 'PYEOF'
+import json, sys
+config_file, models_json = sys.argv[1], sys.argv[2]
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+ec = cfg.get('enterpriseConfig', {})
+for key in ['inferenceProvider', 'inferenceGatewayBaseUrl', 'inferenceGatewayApiKey',
+            'inferenceGatewayAuthScheme', 'inferenceGatewayHeaders']:
+    ec.pop(key, None)
+if models_json:
+    ec['inferenceModels'] = json.loads(models_json)
+else:
+    ec.pop('inferenceModels', None)
+if ec:
+    cfg['enterpriseConfig'] = ec
+else:
+    cfg.pop('enterpriseConfig', None)
+# For non-gateway (Anthropic direct), deploymentMode should not be "3p"
+cfg.pop('deploymentMode', None)
+with open(config_file, 'w') as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+}
+
+# ── Helpers ────────────────────────────────────────────────────────
+cleanup() {
+  if [[ -n "${PROXY_PID:-}" ]]; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
+  fi
+  [[ -n "${PROXY_SCRIPT:-}" ]] && { rm -f "$PROXY_SCRIPT"; PROXY_SCRIPT=""; }
+  [[ -n "${LITELLM_LOG_FILE:-}" ]] && { rm -f "$LITELLM_LOG_FILE"; LITELLM_LOG_FILE=""; }
+  if [[ -n "${LOADED_LOCAL_MODEL:-}" ]] && command -v lms >/dev/null 2>&1; then
+    echo ""
+    echo "Unloading local model: ${LOADED_LOCAL_MODEL}..."
+    lms unload --all 2>/dev/null || true
+  fi
+  if [[ -n "${LMS_DAEMON_STARTED:-}" ]] && command -v lms >/dev/null 2>&1; then
+    echo ""
+    echo "Stopping LM Studio daemon..."
+    lms daemon down 2>/dev/null || true
+  fi
+  if [[ -n "${PREF_BACKUP_FILE:-}" ]]; then
+    restore_prefs "$PREF_BACKUP_FILE"
+    echo "[$(date '+%H:%M:%S')] Restored original Cowork preferences."
+  fi
+}
+
+is_local_url() {
+  [[ "${LM_STUDIO_URL}" =~ ^https?://(localhost|127\.[0-9]+\.[0-9]+\.[0-9]+)(:[0-9]+)?(/.*)?$ ]]
+}
+
+# ── Start a LiteLLM proxy (Anthropic→OpenAI translation gateway) ───
+# Exposes a /v1/messages endpoint that Cowork's gateway mode can reach,
+# translating requests to the upstream OpenAI-compatible provider.
+# Sets PROXY_PORT on success.
+start_litellm_proxy() {
+  local model="$1"
+  local base_url="$2"
+  local api_key="$3"
+
+  if ! command -v litellm >/dev/null 2>&1; then
+    echo "" >&2
+    echo "  Error: 'litellm' is required for external cloud providers." >&2
+    echo "  Install: uv tool install 'litellm[proxy]'" >&2
+    echo "" >&2
+    return 1
+  fi
+
+  PROXY_PORT=$(python3 -c \
+    "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+
+  PROXY_SCRIPT="$(mktemp /tmp/llmcw-litellm.XXXXXX.yaml)"
+  if [[ "$base_url" == *"openrouter.ai"* ]]; then
+    cat > "$PROXY_SCRIPT" << YAML
+model_list:
+  - model_name: "${model}"
+    litellm_params:
+      model: "openrouter/${model}"
+      api_key: "${api_key}"
+
+litellm_settings:
+  drop_params: true
+YAML
+  else
+    cat > "$PROXY_SCRIPT" << YAML
+model_list:
+  - model_name: "${model}"
+    litellm_params:
+      model: "openai/${model}"
+      api_base: "${base_url}"
+      api_key: "${api_key}"
+
+litellm_settings:
+  drop_params: true
+YAML
+  fi
+
+  LITELLM_LOG_FILE="$(mktemp /tmp/llmcw-litellm.XXXXXX.log)"
+  LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true \
+    litellm --config "$PROXY_SCRIPT" --port "$PROXY_PORT" \
+    > "$LITELLM_LOG_FILE" 2>&1 &
+  PROXY_PID=$!
+
+  local elapsed=0
+  while (( elapsed < 100 )); do
+    curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1 && break
+    sleep 0.2
+    (( elapsed++ )) || true
+  done
+
+  if ! curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+    echo "Error: litellm proxy did not start (check ${LITELLM_LOG_FILE})" >&2
+    return 1
+  fi
+}
+
+# ── Fetch local models from LM Studio ──────────────────────────────
+fetch_local_models() {
+  local json
+  json="$(curl -s "$LM_STUDIO_MODELS_API" 2>/dev/null)" || { echo ""; return 1; }
+  echo "$json"
+}
+
+format_size() {
+  local bytes="$1"
+  if (( bytes >= 1073741824 )); then
+    printf "%.1f GB" "$(echo "scale=1; $bytes / 1073741824" | bc)"
+  elif (( bytes >= 1048576 )); then
+    printf "%.1f MB" "$(echo "scale=1; $bytes / 1048576" | bc)"
+  else
+    printf "%d KB" "$(echo "scale=0; $bytes / 1024" | bc)"
+  fi
+}
+
+# ── Config: create ~/.llmcw/config.json template if missing ────────
+ensure_config() {
+  [[ -f "$LLMCW_CONFIG" ]] && return 0
+  mkdir -p "${HOME}/.llmcw"
+  cat > "$LLMCW_CONFIG" << 'JSON'
+{
+  "_comment": [
+    "llmcw cloud model configuration — ~/.llmcw/config.json",
+    "",
+    "STRUCTURE:",
+    "  providers  — named credential + endpoint blocks referenced by model entries.",
+    "  models     — per-tool ordered list of selectable models.",
+    "",
+    "PROVIDER TYPES:",
+    "  'anthropic'         — Use Cowork's account login (no gateway). The selected model is passed",
+    "                        via the inferenceModels preference to override the default.",
+    "  'openai_compatible' — Any OpenAI-compatible endpoint (OpenRouter, DeepInfra, etc.).",
+    "                        llmcw starts a LiteLLM proxy (requires: uv tool install 'litellm[proxy]')",
+    "                        that exposes a /v1/messages gateway endpoint, then configures Cowork",
+    "                        to route through it.",
+    "",
+    "MODEL ID CONVENTIONS BY PROVIDER:",
+    "  anthropic   — Anthropic canonical IDs: claude-opus-4-7, claude-sonnet-4-6, etc.",
+    "                Aliases also accepted: opus, sonnet, haiku",
+    "  openrouter  — provider/model IDs with DOTS for version numbers,",
+    "                e.g. anthropic/claude-opus-4.7 (not 4-7).",
+    "                Verify at: https://openrouter.ai/models",
+    "",
+    "LOCAL MODELS:",
+    "  LM Studio v0.4.1+ exposes an Anthropic-compatible /v1/messages endpoint.",
+    "  llmcw starts the LM Studio daemon if needed, loads the selected model,",
+    "  and configures Cowork's gateway to point at http://localhost:1234.",
+    "",
+    "MODEL LIST FORMAT:",
+    "  Each tool's model list is an object with a 'list' array and optional '_comment' keys.",
+    "  The parser also accepts a bare array for backwards compatibility."
+  ],
+
+  "providers": {
+    "_comment": "Add new providers here. Each tool picks up any provider listed in its model entries.",
+
+    "anthropic": {
+      "name": "Anthropic",
+      "type": "anthropic",
+      "_comment": "Uses Cowork's existing account login. api_key is unused — auth is handled by Claude Desktop.",
+      "api_key": ""
+    },
+    "openrouter": {
+      "name": "OpenRouter",
+      "type": "openai_compatible",
+      "_comment": "Routes to Anthropic and many open-source providers. Good rate-limit failover.",
+      "api_key": "",
+      "base_url": "https://openrouter.ai/api/v1"
+    },
+    "deepinfra": {
+      "name": "DeepInfra",
+      "type": "openai_compatible",
+      "_comment": "Hosts open-source models (Qwen, Llama, Mistral, etc.).",
+      "api_key": "",
+      "base_url": "https://api.deepinfra.com/v1/openai"
+    }
+  },
+
+  "models": {
+    "_comment": "Each entry: {provider, model, display}. Provider must match a key in 'providers' above.",
+
+    "claude": {
+      "_comment": [
+        "Backend: Claude Cowork.",
+        "anthropic entries clear the gateway and use your account login (fastest path).",
+        "openai_compatible entries start a LiteLLM proxy gateway.",
+        "OpenRouter Claude IDs use dots: anthropic/claude-opus-4.7 (verify at openrouter.ai/anthropic)"
+      ],
+      "list": [
+        {"provider": "anthropic",   "model": "claude-opus-4-7",                       "display": "Claude Opus 4.7"},
+        {"provider": "anthropic",   "model": "claude-sonnet-4-6",                     "display": "Claude Sonnet 4.6"},
+        {"provider": "anthropic",   "model": "claude-haiku-4-5-20251001",             "display": "Claude Haiku 4.5"},
+        {"provider": "openrouter",  "model": "anthropic/claude-opus-4.7",             "display": "Claude Opus 4.7"},
+        {"provider": "openrouter",  "model": "anthropic/claude-sonnet-4.6",           "display": "Claude Sonnet 4.6"},
+        {"provider": "openrouter",  "model": "anthropic/claude-haiku-4.5-20251001",   "display": "Claude Haiku 4.5"},
+        {"provider": "openrouter",  "model": "google/gemini-2.5-pro-preview",         "display": "Gemini 2.5 Pro"},
+        {"provider": "openrouter",  "model": "google/gemini-2.5-flash-preview",       "display": "Gemini 2.5 Flash"},
+        {"provider": "openrouter",  "model": "openai/gpt-4.1",                        "display": "GPT-4.1"},
+        {"provider": "openrouter",  "model": "openai/o4-mini",                        "display": "o4-mini"},
+        {"provider": "openrouter",  "model": "meta-llama/llama-4-maverick",           "display": "Llama 4 Maverick"},
+        {"provider": "deepinfra",   "model": "Qwen/Qwen2.5-Coder-32B-Instruct",       "display": "Qwen 2.5 Coder 32B"},
+        {"provider": "deepinfra",   "model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", "display": "Llama 4 Maverick"},
+        {"provider": "deepinfra",   "model": "deepseek-ai/DeepSeek-V3-0324",          "display": "DeepSeek V3"}
+      ]
+    }
+  }
+}
+JSON
+  echo "Created config template: ${LLMCW_CONFIG}"
+  echo "Edit it to add your API keys and configure cloud models."
+  echo ""
+}
+
+# ── Load cloud models from ~/.llmcw/config.json ────────────────────
+# Populates: CLOUD_MODEL_IDS, CLOUD_DISPLAY, CLOUD_PROV_IDS,
+#            CLOUD_PROV_TYPES, CLOUD_API_KEYS, CLOUD_BASE_URLS
+load_cloud_config() {
+  local backend="$1"
+  CLOUD_MODEL_IDS=()
+  CLOUD_DISPLAY=()
+  CLOUD_PROV_IDS=()
+  CLOUD_PROV_TYPES=()
+  CLOUD_API_KEYS=()
+  CLOUD_BASE_URLS=()
+
+  [[ ! -f "$LLMCW_CONFIG" ]] && return 0
+
+  local tmppy
+  tmppy="$(mktemp /tmp/llmcw-cfg.XXXXXX.py)"
+  cat > "$tmppy" << 'PYEOF'
+import json, sys
+
+config_file, backend = sys.argv[1], sys.argv[2]
+
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception as e:
+    sys.stderr.write(f'llmcw: config error: {e}\n')
+    sys.exit(0)
+
+providers = cfg.get('providers', {})
+models_raw = cfg.get('models', {}).get(backend, [])
+models = models_raw.get('list', []) if isinstance(models_raw, dict) else models_raw
+
+def sq(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+arrays = [
+    ('CLOUD_MODEL_IDS',  [m.get('model', '')                                                      for m in models]),
+    ('CLOUD_PROV_IDS',   [m.get('provider', '')                                                   for m in models]),
+    ('CLOUD_PROV_TYPES', [providers.get(m.get('provider',''), {}).get('type', 'openai_compatible') for m in models]),
+    ('CLOUD_API_KEYS',   [providers.get(m.get('provider',''), {}).get('api_key', '')               for m in models]),
+    ('CLOUD_BASE_URLS',  [providers.get(m.get('provider',''), {}).get('base_url', '')              for m in models]),
+    ('CLOUD_DISPLAY',    [
+        m.get('display', m.get('model', '')) + ' ['
+        + providers.get(m.get('provider',''), {}).get('name', m.get('provider','')) + ']'
+        for m in models
+    ]),
+]
+
+for name, values in arrays:
+    print(f'{name}=(')
+    for v in values:
+        print(f'  {sq(v)}')
+    print(')')
+PYEOF
+  eval "$(python3 "$tmppy" "$LLMCW_CONFIG" "$backend")"
+  rm -f "$tmppy"
+}
+
+# ── Quit Claude Desktop and wait for it to exit ────────────────────
+# Must happen BEFORE writing config so Claude's exit doesn't overwrite it.
+quit_if_running() {
+  if pgrep -x "Claude" >/dev/null 2>&1; then
+    echo "Quitting Claude Desktop..."
+    osascript -e 'quit app "Claude"' 2>/dev/null || killall "Claude" 2>/dev/null || true
+    local elapsed=0
+    while pgrep -x "Claude" >/dev/null 2>&1 && (( elapsed < 40 )); do
+      sleep 0.5
+      (( elapsed++ )) || true
+    done
+  fi
+}
+
+# ── Launch Cowork and wait for session to end ──────────────────────
+launch_cowork() {
+  open -a "Claude"
+  echo ""
+  echo "Claude Cowork is open. Press Enter here when your session is done"
+  echo "to restore the original provider settings and clean up."
+  read -r _
+}
+
+# ── Print key fields from the written config (diagnostic) ──────────
+show_config() {
+  python3 - "$CLAUDE_CONFIG" << 'PYEOF'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    ec = cfg.get('enterpriseConfig', {})
+    dm = cfg.get('deploymentMode', '(not set)')
+    print(f"  deploymentMode:            {dm}")
+    print(f"  inferenceProvider:         {ec.get('inferenceProvider', '(not set)')}")
+    print(f"  inferenceGatewayBaseUrl:   {ec.get('inferenceGatewayBaseUrl', '(not set)')}")
+    print(f"  inferenceGatewayAuthScheme:{ec.get('inferenceGatewayAuthScheme', '(not set)')}")
+    print(f"  inferenceModels:           {ec.get('inferenceModels', '(not set)')}")
+except Exception as e:
+    print(f"  ERROR reading config: {e}")
+PYEOF
+}
+
+# ── Main ───────────────────────────────────────────────────────────
+main() {
+  local BACKEND="${1:-claude}"
+  case "$BACKEND" in
+    claude) ;;
+    *) echo "Usage: llmcw [claude]" >&2; exit 1 ;;
+  esac
+
+  ensure_config
+  local -a CLOUD_MODEL_IDS CLOUD_DISPLAY CLOUD_PROV_IDS CLOUD_PROV_TYPES CLOUD_API_KEYS CLOUD_BASE_URLS
+  load_cloud_config "$BACKEND"
+
+  echo "=============================================="
+  echo "  llmcw — LLM Cowork Launcher (${BACKEND})"
+  echo "=============================================="
+  echo ""
+
+  PROXY_PID=""
+  PROXY_SCRIPT=""
+  PROXY_PORT=""
+  LITELLM_LOG_FILE=""
+  LOADED_LOCAL_MODEL=""
+  LMS_DAEMON_STARTED=""
+  PREF_BACKUP_FILE="$(save_prefs)"
+  trap cleanup EXIT
+
+  # ── Start LM Studio daemon if not already running ──────────────
+  if is_local_url && command -v lms >/dev/null 2>&1; then
+    if ! curl -sf "$LM_STUDIO_MODELS_API" >/dev/null 2>&1; then
+      echo "Starting LM Studio daemon..."
+      lms daemon up 2>/dev/null || true
+      LMS_DAEMON_STARTED=1
+      local elapsed=0
+      while (( elapsed < 20 )) && ! curl -sf "$LM_STUDIO_MODELS_API" >/dev/null 2>&1; do
+        sleep 0.5
+        (( elapsed++ )) || true
+      done
+    fi
+  fi
+
+  # ── Fetch local models ─────────────────────────────────────────
+  local local_json
+  local_json="$(fetch_local_models)" || true
+
+  local -a local_keys=() local_names=() local_archs=()
+  local -a local_quants=() local_sizes=() local_contexts=()
+  local -a local_loaded=() local_variants=()
+
+  if [[ -n "$local_json" ]]; then
+    eval "$(python3 -c "
+import json, sys
+
+models = json.loads(sys.argv[1]).get('models', [])
+llms = [m for m in models if m.get('type') == 'llm']
+
+def sq(s):
+    return \"'\" + str(s).replace(\"'\", \"'\\\\''\" ) + \"'\"
+
+print('local_keys=(')
+for m in llms:
+    print(f'    {sq(m[\"key\"])}')
+print(')')
+
+print('local_names=(')
+for m in llms:
+    print(f'    {sq(m.get(\"display_name\", m[\"key\"]))}')
+print(')')
+
+print('local_archs=(')
+for m in llms:
+    print(f'    {sq(m.get(\"architecture\", \"?\"))}')
+print(')')
+
+print('local_quants=(')
+for m in llms:
+    q = m.get('quantization', {})
+    print(f'    {sq(str(q.get(\"name\", \"?\")) + \" (\" + str(q.get(\"bits_per_weight\", \"?\")) + \"bit)\")}')
+print(')')
+
+print('local_sizes=(')
+for m in llms:
+    print(f'    {sq(m.get(\"size_bytes\", 0))}')
+print(')')
+
+print('local_contexts=(')
+for m in llms:
+    print(f'    {sq(m.get(\"max_context_length\", 0))}')
+print(')')
+
+print('local_loaded=(')
+for m in llms:
+    inst = m.get('loaded_instances', [])
+    print(f'    {sq(len(inst))}')
+print(')')
+
+print('local_variants=(')
+for m in llms:
+    variants = m.get('variants', [])
+    sel = m.get('selected_variant', '')
+    if sel:
+        print(f'    {sq(sel)}')
+    elif variants:
+        print(f'    {sq(variants[0])}')
+    else:
+        print(\"    ''\")
+print(')')
+" "$local_json")"
+  fi
+
+  local num_local=${#local_keys[@]}
+  local total=$(( num_local + ${#CLOUD_MODEL_IDS[@]} ))
+
+  # ── Display menu ───────────────────────────────────────────────
+  printf "  %-3s  %s\n" "0" "Default model (no override)"
+  echo ""
+
+  if (( num_local > 0 )); then
+    echo "Local LLMs (from LM Studio):"
+    echo "----------------------------------------------"
+    printf "  %-3s  %-28s  %-8s  %-10s  %-8s  %-8s  %s\n" \
+      "#" "Name" "Arch" "Quant" "Size" "Context" "Loaded"
+    printf "  %-3s  %-28s  %-8s  %-10s  %-8s  %-8s  %s\n" \
+      "---" "----------------------------" "--------" "----------" "--------" "--------" "------"
+    for (( i = 0; i < num_local; i++ )); do
+      local loaded_marker=""
+      (( ${local_loaded[$i]} > 0 )) && loaded_marker=" [LOADED]"
+      printf "  %-3s  %-28s  %-8s  %-10s  %-8s  %-8s  %s\n" \
+        "$((i + 1))" \
+        "${local_names[$i]:-${local_keys[$i]}}" \
+        "${local_archs[$i]}" \
+        "${local_quants[$i]}" \
+        "$(format_size ${local_sizes[$i]})" \
+        "${local_contexts[$i]}" \
+        "${loaded_marker}"
+    done
+    echo ""
+  else
+    echo "No local LLMs found from LM Studio."
+    echo ""
+  fi
+
+  local cloud_label
+  case "$BACKEND" in
+    claude) cloud_label="Claude Cowork models" ;;
+  esac
+
+  echo "${cloud_label}:"
+  echo "----------------------------------------------"
+  if (( ${#CLOUD_MODEL_IDS[@]} > 0 )); then
+    for (( i = 0; i < ${#CLOUD_MODEL_IDS[@]}; i++ )); do
+      local idx=$(( num_local + i + 1 ))
+      printf "  %-3s  %-40s  (%s)\n" "$idx" "${CLOUD_DISPLAY[$i]}" "${CLOUD_MODEL_IDS[$i]}"
+    done
+  else
+    echo "  (none configured — edit ${LLMCW_CONFIG})"
+  fi
+  echo ""
+  printf "  %-3s  %s\n" "Q/E" "Quit / Exit"
+  echo ""
+  echo "----------------------------------------------"
+
+  # ── Prompt for selection ───────────────────────────────────────
+  read -p "Choose a model (0-$total, Q/E to quit) [0]: " opt
+  [[ -z "$opt" ]] && opt=0
+
+  if [[ "$opt" == "q" || "$opt" == "Q" || "$opt" == "e" || "$opt" == "E" ]]; then
+    echo "Goodbye."
+    return 0
+  fi
+
+  if ! [[ "$opt" =~ ^[0-9]+$ ]] || (( opt < 0 )) || (( opt > total )); then
+    echo "Invalid selection."
+    return 1
+  fi
+
+  local model_display=""
+
+  # Quit Claude before writing config so its exit can't overwrite our settings
+  quit_if_running
+
+  if (( opt == 0 )); then
+    model_display="default (no model override)"
+    clear_gateway_prefs
+    echo "Using ${model_display}"
+
+  elif (( opt <= num_local )); then
+    # ── Local model via LM Studio gateway ─────────────────────────
+    local idx=$(( opt - 1 ))
+    local key="${local_keys[$idx]}"
+    local variant="${local_variants[$idx]:-$key}"
+    model_display="${local_names[$idx]:-$key} (local via LM Studio)"
+
+    if is_local_url && command -v lms >/dev/null 2>&1; then
+      local needs_unload=0
+      for (( j = 0; j < num_local; j++ )); do
+        (( ${local_loaded[$j]} > 0 )) && needs_unload=1 || true
+      done
+      if (( needs_unload )); then
+        echo "Unloading current model..."
+        lms unload --all 2>/dev/null || true
+      fi
+      echo "Loading ${local_names[$idx]:-$key}..."
+      lms load "$key"
+      LOADED_LOCAL_MODEL="$key"
+    elif is_local_url; then
+      echo "Warning: 'lms' command not found; skipping model load/unload."
+    else
+      echo "Note: remote LM Studio URL — skipping lms load/unload."
+    fi
+
+    # Use the base key (not the variant) as the model ID — LM Studio treats the
+    # @quantization suffix as a load request, which fails when memory is tight.
+    set_gateway_prefs \
+      "${LM_STUDIO_URL}" \
+      "lmstudio" \
+      "bearer" \
+      "[\"${key}\"]"
+
+    echo "Using local model: ${model_display}"
+    echo "  Gateway:   ${LM_STUDIO_URL}"
+    echo "  Model:     ${key}"
+
+  else
+    # ── Cloud model from config ────────────────────────────────────
+    local cidx=$(( opt - num_local - 1 ))
+    local raw_model="${CLOUD_MODEL_IDS[$cidx]}"
+    local ptype="${CLOUD_PROV_TYPES[$cidx]}"
+    local api_key="${CLOUD_API_KEYS[$cidx]}"
+    local base_url="${CLOUD_BASE_URLS[$cidx]}"
+    model_display="${CLOUD_DISPLAY[$cidx]}"
+
+    case "$BACKEND" in
+      claude)
+        if [[ "$ptype" == "anthropic" ]]; then
+          # Use Cowork's account login — just clear gateway and specify the model
+          clear_gateway_prefs "[\"${raw_model}\"]"
+          echo "Using account login for: ${model_display}"
+          echo "  Model:     ${raw_model}"
+        else
+          # Start LiteLLM proxy → it becomes the /v1/messages gateway for Cowork
+          if [[ -z "$api_key" ]]; then
+            echo "  Warning: API key not set — add api_key for this provider in ${LLMCW_CONFIG}"
+          fi
+          start_litellm_proxy "$raw_model" "$base_url" "$api_key" || return 1
+          set_gateway_prefs \
+            "http://127.0.0.1:${PROXY_PORT}" \
+            "llmcw-proxy" \
+            "bearer" \
+            "[\"${raw_model}\"]"
+          echo "Using cloud model: ${model_display}"
+          echo "  Model:     ${raw_model}"
+          echo "  Proxy:     localhost:${PROXY_PORT} → ${base_url}"
+          echo "  Log:       ${LITELLM_LOG_FILE}"
+        fi
+        ;;
+    esac
+  fi
+
+  echo ""
+  echo "Provider config written to: ${CLAUDE_CONFIG}"
+  show_config
+  echo ""
+  launch_cowork
+}
+
+main "$@"

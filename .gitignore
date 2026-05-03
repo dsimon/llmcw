@@ -1,0 +1,9 @@
+.claude/
+*.env
+
+# User config with credentials lives in ~/.llmcw/ — never in the repo
+config.json
+*.credentials.json
+
+# Build artifacts
+index.js
