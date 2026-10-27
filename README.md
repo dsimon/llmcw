@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Deprecated** — this repo is no longer maintained (2026-10-27).
+
 # llmcw
 
 A macOS shell script launcher for LLM cowork tools. Presents an interactive menu to select from local models (via LM Studio) or cloud models, configures Claude Cowork's inference provider via macOS preferences, launches Claude Desktop, and restores the original settings when you're done.
